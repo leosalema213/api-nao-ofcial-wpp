@@ -1,0 +1,52 @@
+# ==================================
+# .dockerignore
+# ==================================
+# Arquivos que NÃO devem ser copiados para a imagem Docker
+
+# Node modules (serão instalados no container)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Arquivos de ambiente (NUNCA commitar!)
+.env
+.env.local
+.env.*.local
+
+# Arquivos de desenvolvimento
+.git/
+.gitignore
+.vscode/
+.idea/
+*.log
+*.md
+!README.md
+
+# Build artifacts
+dist/
+build/
+coverage/
+
+# Testes
+test/
+tests/
+*.spec.ts
+*.test.ts
+
+# Cache
+.cache/
+.npm/
+.eslintcache
+
+# OS específicos
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Documentação (pode incluir se necessário)
+docs/
+.agent/

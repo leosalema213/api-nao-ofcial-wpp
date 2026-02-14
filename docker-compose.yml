@@ -1,0 +1,77 @@
+# ==================================
+# Docker Compose - Desenvolvimento
+# ==================================
+# Uso: docker-compose up -d
+
+version: '3.8'
+
+services:
+  # Redis (para BullMQ e cache)
+  redis:
+    image: redis:7-alpine
+    container_name: whatsapp-redis
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - whatsapp-network
+    restart: unless-stopped
+
+  # API WhatsApp
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whatsapp-api
+    ports:
+      - '3000:3000'
+    environment:
+      # Supabase (carregar do .env)
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+
+      # Redis (conectar ao container)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+
+      # Application
+      - PORT=3000
+      - NODE_ENV=development
+      - MAX_INSTANCES=${MAX_INSTANCES:-80}
+      - STAGGERED_BOOT_DELAY_MS=${STAGGERED_BOOT_DELAY_MS:-500}
+      - MESSAGES_RETENTION_DAYS=${MESSAGES_RETENTION_DAYS:-7}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      # Hot reload para desenvolvimento (opcional)
+      - ./src:/app/src
+      - ./dist:/app/dist
+    networks:
+      - whatsapp-network
+    restart: unless-stopped
+    # Limites de recursos (ajuste conforme necessário)
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  whatsapp-network:
+    driver: bridge
