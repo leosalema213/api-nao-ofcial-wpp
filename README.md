@@ -88,6 +88,7 @@ n8n → API POST /send → Redis (Fila Outbound) → Worker → Baileys → What
 | **BullMQ**                  | ^5.x    | Sistema de filas             |
 | **ioredis**                 | ^5.x    | Cliente Redis                |
 | **@nestjs/bull**            | ^10.x   | Integração BullMQ com NestJS |
+| **@hapi/boom**              | ^10.0.1 | Gerenciamento de erros HTTP  |
 
 ---
 
