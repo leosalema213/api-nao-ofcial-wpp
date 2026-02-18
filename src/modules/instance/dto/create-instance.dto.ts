@@ -2,7 +2,7 @@
  * DTO para criação de instância WhatsApp
  */
 
-import { IsNotEmpty, IsString, IsUrl, IsUUID } from 'class-validator';
+import { IsNotEmpty, IsString, IsUrl, Matches } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 export class CreateInstanceDto {
@@ -10,7 +10,9 @@ export class CreateInstanceDto {
     description: 'UUID do usuário proprietário',
     example: '550e8400-e29b-41d4-a716-446655440000',
   })
-  @IsUUID('4', { message: 'user_id deve ser um UUID válido' })
+  @Matches(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, {
+    message: 'user_id deve ser um UUID válido',
+  })
   @IsNotEmpty({ message: 'user_id é obrigatório' })
   user_id: string;
 

@@ -21,6 +21,12 @@ export const config = {
   nodeEnv: process.env.NODE_ENV || 'development',
 
   /**
+   * Modo debug — controla exibição de logs de nível DEBUG
+   * Quando false, apenas LOG/WARN/ERROR são exibidos
+   */
+  debugMode: process.env.DEBUG_MODE === 'true',
+
+  /**
    * Quantidade máxima de instâncias WhatsApp simultâneas
    */
   maxInstances: parseInt(process.env.MAX_INSTANCES || '80', 10),

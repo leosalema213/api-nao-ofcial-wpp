@@ -16,6 +16,7 @@ import {
   Logger,
   NotFoundException,
   ConflictException,
+  OnModuleInit,
   OnModuleDestroy,
 } from '@nestjs/common';
 import makeWASocket, {
@@ -29,10 +30,11 @@ import { supabase } from '../../config/supabase.config';
 import { AuthService } from '../auth/auth.service';
 import { CreateInstanceDto } from './dto/create-instance.dto';
 import { WhatsAppInstance, ConnectionStatus } from '../../types/whatsapp.types';
+import { config } from '../../config/app.config';
 import pino from 'pino';
 
 @Injectable()
-export class InstanceService implements OnModuleDestroy {
+export class InstanceService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(InstanceService.name);
 
   /** Sockets ativos em memória */
@@ -44,12 +46,105 @@ export class InstanceService implements OnModuleDestroy {
   /** Flags de reconexão (evitar loops) */
   private reconnecting = new Set<string>();
 
+  /** Concorrência de boot (instâncias por lote) */
+  private readonly BOOT_BATCH_SIZE = 5;
+
+  // ===== FIX 1: Semáforo de reconexão =====
+  /** Limita reconexões simultâneas para evitar pico de CPU/memória */
+  private activeReconnections = 0;
+  private readonly MAX_CONCURRENT_RECONNECTIONS = 5;
+
+  // ===== FIX 2: Limite de retentativas =====
+  /** Contador de retentativas por instância */
+  private reconnectAttempts = new Map<string, number>();
+  private readonly MAX_RECONNECT_ATTEMPTS = 5;
+
+  // ===== FIX 3: Cache da versão do Baileys =====
+  /** Evita HTTP request externo a cada conexão */
+  private cachedVersion: {
+    version: [number, number, number];
+    expires: number;
+  } | null = null;
+  private readonly VERSION_CACHE_TTL = 60 * 60 * 1000; // 1 hora
+
   constructor(private readonly authService: AuthService) {}
+
+  /**
+   * Boot Recovery — reconecta instâncias ativas ao iniciar o servidor
+   *
+   * ESTRATÉGIA ESCALÁVEL:
+   * - Busca instâncias com status 'connected' ou 'connecting' no banco
+   * - Reconecta em lotes de BOOT_BATCH_SIZE (5) para não estourar CPU/memória
+   * - Delay de staggeredBootDelayMs (500ms) entre cada lote
+   * - Respeita maxInstances para não exceder o limite
+   */
+  async onModuleInit(): Promise<void> {
+    const activeResult = await supabase
+      .from('whatsapp_instances')
+      .select('id, instance_name, connection_status')
+      .in('connection_status', ['connected', 'connecting', 'qr_pending'])
+      .order('last_connected_at', { ascending: true })
+      .limit(config.maxInstances);
+
+    const instances = (activeResult.data ??
+      []) as unknown as WhatsAppInstance[];
+
+    if (instances.length === 0) {
+      this.logger.log('Boot Recovery: nenhuma instância ativa para reconectar');
+      return;
+    }
+
+    this.logger.log(
+      `Boot Recovery: reconectando ${instances.length} instância(s) ` +
+        `em lotes de ${this.BOOT_BATCH_SIZE} com ${config.staggeredBootDelayMs}ms de delay`,
+    );
+
+    // Processar em lotes
+    for (let i = 0; i < instances.length; i += this.BOOT_BATCH_SIZE) {
+      const batch = instances.slice(i, i + this.BOOT_BATCH_SIZE);
+      const batchNum = Math.floor(i / this.BOOT_BATCH_SIZE) + 1;
+      const totalBatches = Math.ceil(instances.length / this.BOOT_BATCH_SIZE);
+
+      this.logger.log(
+        `Boot Recovery: lote ${batchNum}/${totalBatches} ` +
+          `(${batch.map((inst) => inst.instance_name).join(', ')})`,
+      );
+
+      // Conectar lote em paralelo
+      await Promise.allSettled(
+        batch.map((inst) =>
+          this.connectInstance(inst.id, inst.instance_name).catch((err) => {
+            this.logger.error(
+              `Boot Recovery: falha ao reconectar ${inst.instance_name}: ${String(err)}`,
+            );
+          }),
+        ),
+      );
+
+      // Delay entre lotes (exceto no último)
+      if (i + this.BOOT_BATCH_SIZE < instances.length) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, config.staggeredBootDelayMs),
+        );
+      }
+    }
+
+    this.logger.log(
+      `Boot Recovery: ${instances.length} instância(s) reconectadas ✅`,
+    );
+  }
 
   /**
    * Cria uma nova instância WhatsApp e inicia a conexão
    */
   async createInstance(dto: CreateInstanceDto): Promise<WhatsAppInstance> {
+    // FIX 4: Verificar limite de instâncias
+    if (this.sockets.size >= config.maxInstances) {
+      throw new ConflictException(
+        `Limite de ${config.maxInstances} instâncias atingido`,
+      );
+    }
+
     // 1. Verificar se instance_name já existe
     const existingResult = await supabase
       .from('whatsapp_instances')
@@ -114,14 +209,13 @@ export class InstanceService implements OnModuleDestroy {
     const { state, saveCreds } =
       await this.authService.getAuthState(instanceName);
 
-    // Buscar versão mais recente do Baileys
-    const { version } = await fetchLatestBaileysVersion();
+    // FIX 3: Usar versão em cache
+    const version = await this.getCachedBaileysVersion();
 
     // Criar socket Baileys
     const sock = makeWASocket({
       version,
       auth: state,
-      printQRInTerminal: true, // Útil para debug local
       logger: pino({ level: 'silent' }) as never, // Silenciar logs do Baileys
       browser: ['WhatsApp API', 'Chrome', '4.0.0'],
       generateHighQualityLinkPreview: false,
@@ -186,9 +280,10 @@ export class InstanceService implements OnModuleDestroy {
     if (connection === 'open') {
       this.logger.log(`✅ Conectado: ${instanceName}`);
 
-      // Limpar QR code
+      // Limpar QR code e contadores
       this.qrCodes.delete(instanceId);
       this.reconnecting.delete(instanceId);
+      this.reconnectAttempts.delete(instanceId); // FIX 2: Reset retentativas
 
       // Obter número do telefone
       const sock = this.sockets.get(instanceId);
@@ -222,20 +317,36 @@ export class InstanceService implements OnModuleDestroy {
       this.qrCodes.delete(instanceId);
 
       if (shouldReconnect && !this.reconnecting.has(instanceId)) {
-        // Auto-reconexão
+        // FIX 2: Verificar limite de retentativas
+        const attempts = (this.reconnectAttempts.get(instanceId) ?? 0) + 1;
+        this.reconnectAttempts.set(instanceId, attempts);
+
+        if (attempts > this.MAX_RECONNECT_ATTEMPTS) {
+          this.logger.error(
+            `❌ ${instanceName}: ${this.MAX_RECONNECT_ATTEMPTS} tentativas esgotadas — marcando como 'failed'`,
+          );
+          this.reconnectAttempts.delete(instanceId);
+          await this.updateConnectionStatus(
+            instanceId,
+            'failed' as ConnectionStatus,
+          );
+          return;
+        }
+
         this.reconnecting.add(instanceId);
-        this.logger.log(`🔄 Reconectando: ${instanceName}...`);
+        this.logger.log(
+          `🔄 Reconectando: ${instanceName} (tentativa ${attempts}/${this.MAX_RECONNECT_ATTEMPTS})...`,
+        );
 
         await this.updateConnectionStatus(instanceId, 'connecting');
 
-        // Delay antes de reconectar (evitar flood)
-        setTimeout(() => {
-          void this.connectInstance(instanceId, instanceName);
-        }, 3000);
+        // FIX 1: Usar semáforo com jitter em vez de setTimeout direto
+        void this.enqueueReconnection(instanceId, instanceName);
       } else {
         // Logout explícito (401) — não reconectar
         this.logger.log(`🚫 Logout: ${instanceName} — sessão removida`);
         this.reconnecting.delete(instanceId);
+        this.reconnectAttempts.delete(instanceId);
 
         await supabase
           .from('whatsapp_instances')
@@ -393,24 +504,81 @@ export class InstanceService implements OnModuleDestroy {
       .eq('id', instanceId);
   }
 
+  // ===== FIX 3: Cache da versão do Baileys =====
   /**
-   * Shutdown gracioso: desconectar todos os sockets
+   * Retorna a versão do Baileys cacheada (1h TTL)
+   * Evita HTTP externo a cada conexão
+   */
+  private async getCachedBaileysVersion(): Promise<[number, number, number]> {
+    if (this.cachedVersion && Date.now() < this.cachedVersion.expires) {
+      return this.cachedVersion.version;
+    }
+
+    const { version } = await fetchLatestBaileysVersion();
+    this.cachedVersion = {
+      version,
+      expires: Date.now() + this.VERSION_CACHE_TTL,
+    };
+    this.logger.debug(`Baileys version cached: ${version.join('.')}`);
+    return version;
+  }
+
+  // ===== FIX 1: Semáforo de reconexão =====
+  /**
+   * Enfileira reconexão com semáforo de concorrência.
+   * Máx MAX_CONCURRENT_RECONNECTIONS simultâneas + jitter aleatório.
+   */
+  private async enqueueReconnection(
+    instanceId: string,
+    instanceName: string,
+  ): Promise<void> {
+    // Esperar slot disponível
+    while (this.activeReconnections >= this.MAX_CONCURRENT_RECONNECTIONS) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
+    // Jitter aleatório: 1s a 5s (evita todas reconectando no mesmo instante)
+    const jitter = 1000 + Math.random() * 4000;
+    await new Promise((resolve) => setTimeout(resolve, jitter));
+
+    this.activeReconnections++;
+    try {
+      await this.connectInstance(instanceId, instanceName);
+    } catch (err) {
+      this.logger.error(`Falha ao reconectar ${instanceName}: ${String(err)}`);
+    } finally {
+      this.activeReconnections--;
+    }
+  }
+
+  /**
+   * FIX 5: Shutdown gracioso paralelo em lotes
    */
   async onModuleDestroy(): Promise<void> {
-    this.logger.log('Desconectando todas as instâncias...');
+    this.logger.log(`Desconectando ${this.sockets.size} instância(s)...`);
 
-    for (const [instanceId, sock] of this.sockets.entries()) {
-      try {
-        sock.end(undefined);
-        await this.updateConnectionStatus(instanceId, 'disconnected');
-      } catch (err) {
-        this.logger.error(`Erro ao desconectar ${instanceId}: ${String(err)}`);
-      }
+    // Desconectar sockets em paralelo (lotes de BOOT_BATCH_SIZE)
+    const entries = Array.from(this.sockets.entries());
+    for (let i = 0; i < entries.length; i += this.BOOT_BATCH_SIZE) {
+      const batch = entries.slice(i, i + this.BOOT_BATCH_SIZE);
+      await Promise.allSettled(
+        batch.map(async ([instanceId, sock]) => {
+          try {
+            sock.end(undefined);
+            await this.updateConnectionStatus(instanceId, 'disconnected');
+          } catch (err) {
+            this.logger.error(
+              `Erro ao desconectar ${instanceId}: ${String(err)}`,
+            );
+          }
+        }),
+      );
     }
 
     this.sockets.clear();
     this.qrCodes.clear();
     this.reconnecting.clear();
+    this.reconnectAttempts.clear();
 
     // Flush escritas pendentes do AuthService
     await this.authService.flushPendingWrites();
